@@ -1,471 +1,125 @@
-# 📝 Resposta do Laboratório: A Wiki Perdida dos Arquivos Corporativos
+# Desafio: Wiki Inteligente de Conhecimento da Empresa na AWS
 
-> Preencha este arquivo com a sua proposta de solução.
->
-> Sua resposta deve explicar como transformar os documentos brutos da pasta `raw/` em uma Wiki Corporativa Inteligente, pesquisável e segura usando apenas serviços da AWS.
+## Identificação
 
----
-
-## 👤 Identificação
-
-**Nome:**  
-Preencha aqui
-
-**Data:**  
-Preencha aqui
-
-**Link do repositório:**  
-Preencha aqui
+- **Nome:** Daniel dos Santos Bonilho Passiani
+- **Repositório:** https://github.com/danielpassiani/laboratorio-wiki-aws
 
 ---
 
-# ✅ Quest 1: O Mapa dos Arquivos Perdidos
+## Quest 1 — O Mapa dos Arquivos Perdidos
 
-## 1.1 Formatos encontrados na pasta `raw/`
+Antes de desenhar qualquer arquitetura, o primeiro passo é entender que os três arquivos dentro de `raw/` não são variações do mesmo problema — são três problemas diferentes disfarçados de "documentos da empresa".
 
-Descreva quais tipos de arquivos existem dentro da pasta `raw/`.
+### 1. Ata em PDF (5 páginas, texto nativo)
+É um PDF gerado digitalmente (Word, Google Docs, etc.), então o texto já existe como camada de texto dentro do arquivo — não é uma imagem. O que precisa ser extraído: decisões tomadas, responsáveis, datas e nomes de projetos citados nas atas, que são exatamente o tipo de informação que alguém vai perguntar depois ("qual foi a decisão sobre o projeto X").
 
-```md
-Exemplo de como responder, com o formato e o que ele implica:
-- <extensao>: <nasce digital ou precisa de OCR?>, <o que da para extrair>
-```
+### 2. Folha digitalizada (imagem, com anotações à mão)
+Aqui não existe camada de texto nenhuma — é só pixel. Pior: além do texto impresso original, tem anotação manuscrita por cima, que é o tipo de conteúdo mais frágil de extrair (a confiança do reconhecimento cai bastante em relação a texto impresso). Esse arquivo exige OCR de verdade, e um OCR que também lide com escrita à mão — não dá pra tratar como o PDF, porque o PDF já "nasce" legível e esse não.
 
-> Abra a pasta e liste o que voce encontrou de fato. Esta quest avalia a sua
-> leitura do acervo, entao a resposta certa e a que corresponde aos arquivos.
+### 3. Exportação do CRM em CSV (centenas de linhas, 19 colunas)
+Esse não tem problema de legibilidade — já é texto estruturado. O problema aqui é outro: não é extração, é modelagem. Cada linha é um registro (uma oportunidade comercial), e a decisão importante é como transformar uma linha de 19 colunas em uma unidade de conhecimento que faça sentido isolada (ex: "oportunidade X, estágio Y, responsável Z, data da última atualização, observações") em vez de jogar o CSV inteiro como um blob de texto.
 
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
+**Por que isso importa para o resto do desafio:** tratar os três como "documento genérico -> OCR -> texto -> índice" ignora que só um dos três de fato precisa de OCR, e que o CSV precisa de uma lógica de estruturação que os outros dois não precisam. Essa diferenciação é a espinha dorsal das Quests 2 e 3.
 
 ---
 
-## 1.2 Principais desafios encontrados
+## Quest 2 — O Portal de Entrada na AWS
 
-Explique quais dificuldades esses documentos podem apresentar.
+### Gatilho de entrada
+`raw/` já existe e não deve ser alterado. Uso uma **notificação de evento do S3** (`ObjectCreated`) na pasta `raw/` para disparar uma **Step Functions state machine**, que funciona como um roteador por tipo de arquivo.
 
-```md
-Exemplo:
-- Arquivos sem padrão de nomenclatura
-- Documentos escaneados com baixa qualidade
-- Textos manuscritos ou parcialmente ilegíveis
-- Atas com estruturas diferentes
-- Informações importantes espalhadas em vários formatos
-```
+**Por que Step Functions e não só uma Lambda encadeando tudo:** os três formatos seguem caminhos completamente diferentes a partir daqui. Step Functions me dá branches condicionais visuais, retry automático (importante porque o Textract assíncrono trabalha via callback/SNS, não é síncrono) e rastreabilidade de cada execução — essencial quando três tipos de arquivo tomam três caminhos distintos a partir do mesmo gatilho.
 
-**Sua resposta:**
+### Caminho 1 — Ata em PDF
+`Amazon Textract` (`StartDocumentTextDetection`, modo assíncrono porque o PDF tem 5 páginas). Uso o Textract aqui mesmo o PDF já tendo texto nativo, para manter uma única API de extração e não duplicar lógica — mas o ponto real é que ele já resolve os outros dois casos também.
 
-```md
-Preencha aqui.
-```
+### Caminho 2 — Folha digitalizada
+`Amazon Textract` novamente, mas usando o suporte a **reconhecimento de escrita à mão** (o Textract detecta tanto texto impresso quanto manuscrito na mesma chamada). Uso o Textract aqui porque parte do acervo é foto, e sem OCR esse conteúdo simplesmente não entra na base — ele fica, literalmente, invisível para qualquer busca. Guardo também o **score de confiança** retornado pelo Textract junto com o texto, porque escrita à mão erra mais, e eu preciso saber depois quais trechos merecem menos confiança na hora de responder.
 
----
+### Caminho 3 — Exportação CSV
+Aqui **não uso Textract** — seria desperdício de custo e tempo de processamento em algo que já é texto estruturado. Uso uma **Lambda simples** que faz o parse do CSV, valida colunas e converte cada linha em um registro JSON. É o único dos três caminhos que não passa por OCR.
 
-## 1.3 Informações importantes a serem extraídas
-
-Liste quais informações precisam ser identificadas para transformar os documentos em conhecimento pesquisável.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
+### Armazenamento de saída
+Todo o texto extraído (dos três caminhos) é salvo em um **bucket/prefixo `processed/`** separado do `raw/` — nunca escrevo de volta em cima do bruto, para preservar a regra de não alterar `raw/`. Cada saída carrega uma referência ao arquivo de origem, para nunca perder o rastro de onde aquele texto veio (fundamental para a citação da Quest 4).
 
 ---
 
-## 1.4 Estratégia de classificação inicial
+## Quest 3 — A Relíquia dos Metadados
 
-Como você classificaria os documentos sem depender de subpastas dentro de `raw/`?
+Depois da extração, tenho três formatos de saída completamente diferentes (texto de ata, texto+confiança de OCR, JSON de linha de CRM). O objetivo desta etapa é fazer os três "falarem a mesma língua" sem perder o que cada um tem de específico.
 
-**Sua resposta:**
+### Padronização
+Defino um envelope único de metadados para qualquer unidade de conhecimento, independente da origem:
 
-```md
-Preencha aqui.
 ```
+doc_id, arquivo_origem, tipo_origem (ata | scan | crm_linha),
+texto_extraido, confianca_ocr (nulo para o CSV),
+entidades (pessoas, datas, nomes de projeto),
+data_processamento, status (ok | revisar)
+```
+
+### Enriquecimento
+Uso o **Amazon Comprehend** para rodar reconhecimento de entidades e extração de frases-chave sobre o texto não estruturado (ata e folha digitalizada), populando automaticamente os campos de pessoas, datas e projetos citados. O CSV já chega estruturado, então pulo essa etapa para ele e aproveito as próprias colunas do CRM como metadados.
+
+### Organização e controle de qualidade
+Guardo esse registro padronizado em uma tabela **DynamoDB** (`document-registry`), com `doc_id` como chave. Isso me dá duas coisas: um jeito rápido de auditar o que já foi processado, e um campo de status que marca como `revisar` qualquer trecho da folha digitalizada com confiança de OCR baixa — porque não quero que um erro de leitura de letra manuscrita vire uma "verdade" na base de conhecimento sem alguém checar.
+
+O texto final normalizado (um arquivo por unidade: uma ata, uma folha, uma linha de CRM) é salvo em `processed/documents/`, pronto para a etapa de indexação.
 
 ---
 
-# ✅ Quest 2: O Portal de Entrada na AWS
+## Quest 4 — O Oráculo da Wiki Inteligente
 
-## 2.1 Armazenamento dos arquivos brutos
+### Indexação
+Uso **Amazon Bedrock Knowledge Bases** apontando para o prefixo `processed/documents/` no S3. O Bedrock KB cuida de:
+- dividir o texto em chunks,
+- gerar embeddings com o **Amazon Titan Text Embeddings**,
+- armazenar os vetores em uma coleção **Amazon OpenSearch Serverless**.
 
-Explique como os arquivos da pasta `raw/` seriam enviados e armazenados na AWS.
+**Por que Bedrock Knowledge Bases e não montar uma pipeline de vetores na mão:** ele já resolve chunking, embedding e — o mais importante para este desafio — **citação da fonte** de forma nativa, sem precisar reinventar essa lógica. E continua sendo 100% serviço AWS, respeitando a regra de nada de ferramenta externa de OCR ou IA.
 
-Serviços que você pode considerar:
+### Busca e resposta
+Quando alguém pergunta algo como "qual foi a decisão sobre o projeto X", a pergunta vai para a API `RetrieveAndGenerate` do Bedrock: ela busca os chunks mais relevantes no índice vetorial, passa esse contexto para um modelo de linguagem do Bedrock, e gera a resposta em linguagem natural. A resposta vem acompanhada dos metadados de origem do chunk usado — que eu cruzo com o `document-registry` no DynamoDB para apontar exatamente qual arquivo original (`raw/ata.pdf`, `raw/folha.jpg` ou uma linha específica do CRM) sustenta aquela resposta.
 
-- Amazon S3
-- AWS IAM
-- AWS KMS
-- Amazon S3 Versioning
-- Amazon S3 Lifecycle
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
+### Alternativa considerada
+O **Amazon Kendra** resolveria a parte de busca em linguagem natural com citação de forma mais "pronta", exigindo menos configuração de embeddings. Descartei como opção principal porque o Bedrock KB dá mais controle sobre como a resposta é sintetizada (não só busca, mas geração da resposta final), que é o que o desafio pede ("a solução responde citando o documento").
 
 ---
 
-## 2.2 Preservação dos arquivos originais
+## Diagrama da Arquitetura
 
-Explique como garantir que os arquivos originais sejam mantidos intactos e rastreáveis.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
+```mermaid
+flowchart TD
+    A["raw/ (S3): ata.pdf, folha.jpg, crm.csv"] -->|Evento S3 ObjectCreated| B[Step Functions - roteador por tipo]
+    B -->|.pdf| C[Amazon Textract - texto nativo]
+    B -->|.jpg / .png| D[Amazon Textract - OCR + escrita a mao]
+    B -->|.csv| E[Lambda - parser CSV]
+    C --> F["processed/ (S3): texto + confianca"]
+    D --> F
+    E --> F
+    F --> G[Amazon Comprehend - entidades e frases-chave]
+    G --> H[DynamoDB - document-registry]
+    G --> I["processed/documents/ (S3) - unidades normalizadas"]
+    I --> J[Bedrock Knowledge Bases - chunking + embeddings Titan]
+    J --> K[OpenSearch Serverless - indice vetorial]
+    L[Usuario pergunta em linguagem natural] --> M[Bedrock RetrieveAndGenerate]
+    K --> M
+    H --> M
+    M --> N[Resposta citando o documento original]
 ```
 
 ---
 
-## 2.3 Extração de texto dos documentos
+## Ideias Para Evoluir (não implementadas, propostas como próximo passo)
 
-Explique como cada tipo de arquivo seria processado.
-
-Considere:
-
-- PDFs escaneados;
-- Imagens;
-- PDFs digitais;
-- Arquivos `.txt`;
-- Arquivos `.docx`;
-- Arquivos `.md`.
-
-Serviços que você pode considerar:
-
-- Amazon Textract
-- AWS Lambda
-- AWS Step Functions
-- Amazon S3
-- Amazon CloudWatch
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
+- Automatizar toda a ingestão hoje já é o desenho proposto (gatilho no S3), então o próximo passo natural seria adicionar uma fila de reprocessamento para arquivos que falharem no Textract.
+- Classificar documentos por confidencialidade usando os metadados no DynamoDB, restringindo quais índices um perfil de usuário pode consultar via Bedrock Agents com controle de acesso por atributo.
+- Definir explicitamente o que a Wiki responde quando a base não tem a informação: usar o próprio prompt de geração do Bedrock para instruir o modelo a admitir a ausência de dado em vez de "alucinar" uma resposta.
+- Estimar custo mensal considerando o volume real de OCR (Textract cobra por página) versus o custo de manter o índice do OpenSearch Serverless sempre ativo.
 
 ---
 
-## 2.4 Tratamento de falhas
+## O que aprendi
 
-Explique como sua solução identificaria e registraria erros de processamento.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-# ✅ Quest 3: A Relíquia dos Metadados
-
-## 3.1 Padronização dos textos processados
-
-Explique como os textos extraídos seriam limpos, normalizados e preparados para consulta.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 3.2 Metadados propostos
-
-Defina quais metadados você extrairia de cada documento.
-
-| Metadado | Por que ele é importante? |
-|---|---|
-| Nome do documento | Preencha aqui |
-| Tipo do documento | Preencha aqui |
-| Data identificada | Preencha aqui |
-| Tema principal | Preencha aqui |
-| Participantes | Preencha aqui |
-| Decisões tomadas | Preencha aqui |
-| Responsáveis | Preencha aqui |
-| Próximos passos | Preencha aqui |
-| Nível de confidencialidade | Preencha aqui |
-| Caminho do arquivo original | Preencha aqui |
-
-Adicione outros metadados, se necessário.
-
----
-
-## 3.3 Uso de IA para enriquecimento dos documentos
-
-Explique como o Amazon Bedrock poderia ajudar a identificar temas, decisões, responsáveis, pendências e resumos dos documentos.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 3.4 Armazenamento dos metadados
-
-Explique onde os metadados seriam armazenados e como seriam conectados aos documentos originais.
-
-Serviços que você pode considerar:
-
-- Amazon S3
-- Amazon DynamoDB
-- AWS Glue Data Catalog
-- Amazon Bedrock Knowledge Bases
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-# ✅ Quest 4: O Oráculo da Wiki Inteligente
-
-## 4.1 Estratégia de indexação
-
-Explique como os documentos seriam divididos em trechos menores e preparados para busca semântica.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 4.2 Busca semântica e base vetorial
-
-Explique como embeddings seriam gerados e onde seriam armazenados.
-
-Serviços que você pode considerar:
-
-- Amazon Bedrock Knowledge Bases
-- Amazon OpenSearch Serverless
-- Amazon Aurora PostgreSQL com pgvector
-- Amazon S3 Vectors
-- Modelos de embeddings no Amazon Bedrock
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 4.3 Geração de respostas com IA
-
-Explique como a Wiki responderia perguntas em linguagem natural com base nos documentos originais.
-
-Considere explicar:
-
-- Como a pergunta do usuário seria recebida;
-- Como os trechos relevantes seriam recuperados;
-- Como o Amazon Bedrock geraria a resposta;
-- Como a resposta indicaria as fontes utilizadas.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 4.4 Interface de consulta
-
-Proponha como os usuários acessariam essa Wiki Inteligente.
-
-Serviços que você pode considerar:
-
-- Amazon Q Business
-- AWS Amplify
-- Amazon API Gateway
-- AWS Lambda
-- Amazon Cognito
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 4.5 Segurança, auditoria e monitoramento
-
-Explique como controlar acesso, proteger dados, auditar consultas e monitorar custos, erros e qualidade das respostas.
-
-Serviços que você pode considerar:
-
-- AWS IAM
-- AWS KMS
-- Amazon Cognito
-- AWS CloudTrail
-- Amazon CloudWatch
-- Amazon Macie
-- AWS Cost Explorer
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-# 🧩 Arquitetura Final da Solução
-
-Agora reúna tudo em uma visão única.
-
-## 1. Visão geral
-
-Explique em poucas linhas a ideia central da sua arquitetura.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 2. Serviços AWS utilizados
-
-| Serviço AWS | Papel na solução |
-|---|---|
-| Amazon S3 | Preencha aqui |
-| Amazon Textract | Preencha aqui |
-| Amazon Bedrock | Preencha aqui |
-| Amazon Bedrock Knowledge Bases | Preencha aqui |
-| AWS Lambda | Preencha aqui |
-| AWS Step Functions | Preencha aqui |
-| Amazon CloudWatch | Preencha aqui |
-| AWS IAM | Preencha aqui |
-| AWS KMS | Preencha aqui |
-
-Adicione, remova ou ajuste os serviços conforme sua proposta.
-
----
-
-## 3. Fluxo de dados de ponta a ponta
-
-Descreva o caminho dos dados desde a pasta `raw/` até a Wiki Inteligente.
-
-```md
-Exemplo de estrutura:
-
-1. Arquivos estão inicialmente na pasta raw/
-2. Arquivos são enviados para o Amazon S3
-3. Documentos escaneados passam pelo Amazon Textract
-4. Arquivos digitais têm seus textos extraídos
-5. Textos são limpos e padronizados
-6. Metadados são extraídos
-7. Conteúdos são indexados em uma base pesquisável
-8. Usuário pesquisa na Wiki
-9. IA responde com base nos documentos originais
-```
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 4. Diagrama textual da arquitetura
-
-Crie um diagrama simples usando texto.
-
-```md
-Exemplo:
-
-raw/ → Amazon S3 → Lambda/Step Functions → Textract → S3 Processado → Bedrock Knowledge Bases → Interface de Consulta → Usuário Final
-```
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 5. Riscos e limitações
-
-Liste possíveis desafios da sua solução.
-
-```md
-Exemplo:
-- Documentos ilegíveis podem prejudicar a extração de texto.
-- OCR pode gerar erros em documentos com baixa qualidade.
-- Custos podem aumentar conforme o volume de documentos.
-- Metadados inferidos por IA podem precisar de validação humana.
-- Respostas geradas por IA devem sempre referenciar documentos de origem.
-```
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-## 6. Melhorias futuras
-
-Descreva como a solução poderia evoluir.
-
-```md
-Exemplo:
-- Criar uma interface web para consulta.
-- Criar um chat interno para perguntas sobre atas.
-- Adicionar controle de acesso por departamento.
-- Criar dashboard de decisões e pendências.
-- Gerar alertas automáticos sobre ações em aberto.
-- Integrar com ferramentas corporativas.
-```
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
-
----
-
-# 🧠 Checklist Final
-
-Antes de entregar, confirme se sua solução responde:
-
-- [ ] Como transformar documentos escaneados em texto?
-- [ ] Como lidar com diferentes formatos dentro da mesma pasta `raw/`?
-- [ ] Como armazenar os documentos originais?
-- [ ] Como preservar a rastreabilidade entre resposta e documento fonte?
-- [ ] Como organizar metadados?
-- [ ] Como criar busca semântica?
-- [ ] Como usar Amazon Bedrock na solução?
-- [ ] Como proteger documentos sensíveis?
-- [ ] Como monitorar falhas?
-- [ ] Como a empresa usaria essa Wiki no dia a dia?
-
----
-
-# 🏁 Conclusão
-
-Escreva uma breve conclusão defendendo sua solução como se estivesse apresentando para uma liderança técnica ou de negócio.
-
-**Sua resposta:**
-
-```md
-Preencha aqui.
-```
+*(Com este desafio, fui capaz de aprender e desenvolver minha lógica em cloud computing. Pude entender de uma forma muito intuitiva e fiel a tudo que vi nos vídeos passados pela plataforma da Dio, fiquei muito feliz em poder participar desse projeto e me desenvolver como profissional e estudante.)*
